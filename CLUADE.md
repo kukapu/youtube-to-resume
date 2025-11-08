@@ -1,0 +1,1 @@
+This application is gonna be a interface where can easy look the note about every episode in all seasons series. It's gonna start with imdb (maybe in the future add another resources). 
