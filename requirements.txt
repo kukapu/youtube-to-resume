@@ -7,4 +7,6 @@ pydantic==2.6.0
 pydantic-settings==2.1.0
 python-multipart==0.0.9
 httpx==0.26.0
-pydub==0.25.1
+requests>=2.31.0
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9

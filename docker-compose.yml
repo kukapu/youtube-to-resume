@@ -10,14 +10,41 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - SUMMARY_MODEL=${SUMMARY_MODEL:-openai/gpt-4o-mini}
       - TRANSCRIPTION_MODEL=${TRANSCRIPTION_MODEL:-openai/whisper-large-v3}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PORT=8000
+      - DATABASE_URL=postgresql://youtube_user:youtube_pass@db:5432/youtube_summaries
     restart: unless-stopped
     volumes:
       # Opcional: para logs persistentes
       - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  db:
+    image: postgres:16-alpine
+    container_name: youtube-summarizer-db
+    environment:
+      - POSTGRES_USER=youtube_user
+      - POSTGRES_PASSWORD=youtube_pass
+      - POSTGRES_DB=youtube_summaries
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U youtube_user -d youtube_summaries"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

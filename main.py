@@ -3,12 +3,14 @@ import tempfile
 import re
 from typing import Optional, List
 from pathlib import Path
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 from pydantic_settings import BaseSettings
+from sqlalchemy.orm import Session
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
@@ -19,11 +21,15 @@ import yt_dlp
 import httpx
 from pydub import AudioSegment
 
+from database import get_db, init_db, Summary as DBSummary
+
 
 class Settings(BaseSettings):
     openrouter_api_key: str
     summary_model: str = "openai/gpt-4o-mini"
     transcription_model: str = "openai/whisper-large-v3"
+    groq_api_key: str = ""
+    openai_api_key: str = ""
     port: int = 8000
 
     class Config:
@@ -32,6 +38,12 @@ class Settings(BaseSettings):
 
 settings = Settings()
 app = FastAPI(title="YouTube Video Summarizer")
+
+# Inicializar la base de datos al iniciar la aplicación
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    print("✓ Base de datos inicializada")
 
 
 class VideoRequest(BaseModel):
@@ -45,6 +57,16 @@ class SummaryResponse(BaseModel):
     transcript_method: str  # "subtitles" o "transcription"
     summary: str
     cost_estimate: str
+    created_at: Optional[datetime] = None
+
+
+class SummaryListItem(BaseModel):
+    video_id: str
+    title: str
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -64,58 +86,109 @@ def extract_video_id(url: str) -> Optional[str]:
 
 def get_subtitles(video_id: str, language: str = "es") -> Optional[str]:
     """
-    Intenta obtener los subtítulos del video.
-    Primero busca en español, luego en inglés, y finalmente en cualquier idioma disponible.
+    Intenta obtener los subtítulos del video usando yt-dlp.
+    Esto es más robusto que youtube-transcript-api.
     """
     try:
-        # Intentar obtener lista de transcripciones disponibles
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        ydl_opts = {
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': [language, 'en'],
+            'skip_download': True,
+            'quiet': True,
+            'no_warnings': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            },
+        }
 
-        # Intentar obtener transcripción en el idioma solicitado
-        try:
-            transcript = transcript_list.find_transcript([language])
-            text = " ".join([entry['text'] for entry in transcript.fetch()])
-            return text
-        except NoTranscriptFound:
-            pass
-
-        # Si no está en español, intentar en inglés
-        if language != "en":
-            try:
-                transcript = transcript_list.find_transcript(['en'])
-                text = " ".join([entry['text'] for entry in transcript.fetch()])
-                return text
-            except NoTranscriptFound:
-                pass
-
-        # Si no, tomar el primer idioma disponible
-        try:
-            transcript = transcript_list.find_generated_transcript(['en', 'es', 'auto'])
-            text = " ".join([entry['text'] for entry in transcript.fetch()])
-            return text
-        except:
-            pass
-
-        # Último intento: cualquier transcripción manual
-        for transcript in transcript_list:
-            if not transcript.is_generated:
-                text = " ".join([entry['text'] for entry in transcript.fetch()])
-                return text
-
-        # Último último intento: cualquier transcripción
-        for transcript in transcript_list:
-            text = " ".join([entry['text'] for entry in transcript.fetch()])
-            return text
-
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            
+            # Intentar obtener subtítulos en el idioma solicitado
+            if 'subtitles' in info and info['subtitles']:
+                if language in info['subtitles']:
+                    subtitle_data = info['subtitles'][language]
+                    if subtitle_data and len(subtitle_data) > 0:
+                        # Descargar el primer formato disponible
+                        subtitle_url = subtitle_data[0]['url']
+                        import requests
+                        response = requests.get(subtitle_url)
+                        if response.status_code == 200:
+                            # Parsear el contenido (puede ser VTT o SRT)
+                            text = parse_subtitle_content(response.text)
+                            if text:
+                                char_count = len(text)
+                                word_count = len(text.split())
+                                print(f"✓ Subtítulos manuales obtenidos en {language} ({word_count} palabras, {char_count} caracteres)")
+                                return text
+                
+                # Intentar inglés si no está en el idioma solicitado
+                if 'en' in info['subtitles']:
+                    subtitle_data = info['subtitles']['en']
+                    if subtitle_data and len(subtitle_data) > 0:
+                        subtitle_url = subtitle_data[0]['url']
+                        import requests
+                        response = requests.get(subtitle_url)
+                        if response.status_code == 200:
+                            text = parse_subtitle_content(response.text)
+                            if text:
+                                char_count = len(text)
+                                word_count = len(text.split())
+                                print(f"✓ Subtítulos manuales obtenidos en inglés ({word_count} palabras, {char_count} caracteres)")
+                                return text
+            
+            # Intentar con subtítulos automáticos
+            if 'automatic_captions' in info and info['automatic_captions']:
+                for lang in [language, 'en']:
+                    if lang in info['automatic_captions']:
+                        subtitle_data = info['automatic_captions'][lang]
+                        if subtitle_data and len(subtitle_data) > 0:
+                            subtitle_url = subtitle_data[0]['url']
+                            import requests
+                            response = requests.get(subtitle_url)
+                            if response.status_code == 200:
+                                text = parse_subtitle_content(response.text)
+                                if text:
+                                    char_count = len(text)
+                                    word_count = len(text.split())
+                                    print(f"✓ Subtítulos automáticos obtenidos en {lang} ({word_count} palabras, {char_count} caracteres)")
+                                    return text
+        
         return None
     except Exception as e:
         print(f"Error obteniendo subtítulos: {e}")
         return None
 
 
-def download_audio(video_id: str) -> Optional[str]:
-    """Descarga el audio del video y devuelve la ruta del archivo."""
+def parse_subtitle_content(content: str) -> Optional[str]:
+    """Parsea el contenido de subtítulos (VTT o SRT) y extrae solo el texto."""
+    try:
+        lines = content.split('\n')
+        text_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            # Saltar líneas vacías, marcadores de tiempo y headers
+            if not line or line.startswith('WEBVTT') or '-->' in line or line.isdigit():
+                continue
+            # Saltar etiquetas de formato
+            if line.startswith('<') or line.startswith('['):
+                continue
+            text_lines.append(line)
+        
+        return ' '.join(text_lines)
+    except Exception as e:
+        print(f"Error parseando subtítulos: {e}")
+        return None
+
+
+def download_audio(video_id: str, max_size_mb: int = 24) -> Optional[tuple[str, float]]:
+    """Descarga el audio del video optimizado para APIs.
+    
+    Returns:
+        tuple: (audio_path, file_size_mb) o None
+    """
     try:
         temp_dir = tempfile.mkdtemp()
         output_path = os.path.join(temp_dir, f"{video_id}.mp3")
@@ -125,7 +198,7 @@ def download_audio(video_id: str) -> Optional[str]:
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '64',  # Baja calidad para ahorrar
+                'preferredquality': '32',  # Muy baja calidad para reducir tamaño
             }],
             'outtmpl': os.path.join(temp_dir, f"{video_id}.%(ext)s"),
             'quiet': True,
@@ -149,67 +222,76 @@ def download_audio(video_id: str) -> Optional[str]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
-        return output_path if os.path.exists(output_path) else None
+        if os.path.exists(output_path):
+            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"📁 Audio descargado: {file_size_mb:.2f}MB")
+            
+            if file_size_mb > max_size_mb:
+                print(f"⚠️ Archivo muy grande ({file_size_mb:.2f}MB), comprimiendo...")
+                # Intentar comprimir más
+                compressed_path = compress_audio(output_path, target_mb=max_size_mb)
+                if compressed_path:
+                    os.remove(output_path)
+                    return compressed_path, os.path.getsize(compressed_path) / (1024 * 1024)
+            
+            return output_path, file_size_mb
+        
+        return None
     except Exception as e:
         print(f"Error descargando audio: {e}")
         return None
 
 
-def split_audio_into_chunks(audio_path: str, chunk_duration_ms: int = 600000) -> List[str]:
-    """
-    Divide un archivo de audio en chunks más pequeños.
-
-    Args:
-        audio_path: Ruta al archivo de audio
-        chunk_duration_ms: Duración de cada chunk en milisegundos (default: 10 minutos)
-
-    Returns:
-        Lista de rutas a los archivos de chunks
-    """
+def compress_audio(input_path: str, target_mb: int = 24) -> Optional[str]:
+    """Comprime el audio para que quepa en el límite de la API."""
     try:
-        # Cargar el audio
-        audio = AudioSegment.from_mp3(audio_path)
-
-        # Calcular número de chunks necesarios
-        total_duration = len(audio)
-        chunks = []
-
-        # Si el audio es más corto que el chunk_duration, devolver el archivo original
-        if total_duration <= chunk_duration_ms:
-            return [audio_path]
-
-        # Dividir en chunks
-        temp_dir = os.path.dirname(audio_path)
-        base_name = os.path.splitext(os.path.basename(audio_path))[0]
-
-        for i, start_time in enumerate(range(0, total_duration, chunk_duration_ms)):
-            end_time = min(start_time + chunk_duration_ms, total_duration)
-            chunk = audio[start_time:end_time]
-
-            chunk_path = os.path.join(temp_dir, f"{base_name}_chunk_{i}.mp3")
-            chunk.export(chunk_path, format="mp3", bitrate="64k")
-            chunks.append(chunk_path)
-
-        print(f"Audio dividido en {len(chunks)} chunks")
-        return chunks
+        import subprocess
+        output_path = input_path.replace('.mp3', '_compressed.mp3')
+        
+        # Usar ffmpeg para comprimir a calidad muy baja
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-ab', '24k',  # Bitrate muy bajo
+            '-ar', '16000',  # Sample rate bajo
+            '-ac', '1',  # Mono
+            '-y', output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0 and os.path.exists(output_path):
+            new_size = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"✓ Audio comprimido a {new_size:.2f}MB")
+            return output_path
+        
+        return None
     except Exception as e:
-        print(f"Error dividiendo audio en chunks: {e}")
-        return [audio_path]  # Si falla, devolver el archivo original
+        print(f"Error comprimiendo audio: {e}")
+        return None
 
 
-async def transcribe_audio_chunk(chunk_path: str) -> Optional[str]:
-    """Transcribe un chunk de audio usando OpenRouter (Whisper)."""
+async def transcribe_with_groq(audio_path: str) -> Optional[str]:
+    """Transcribe el audio usando Groq Whisper (GRATIS y rápido)."""
+    if not settings.groq_api_key:
+        print("⚠️ GROQ_API_KEY no configurada")
+        return None
+    
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
-            with open(chunk_path, 'rb') as audio_file:
-                files = {'file': audio_file}
-                data = {'model': settings.transcription_model}
+            with open(audio_path, 'rb') as audio_file:
+                files = {'file': (os.path.basename(audio_path), audio_file, 'audio/mpeg')}
+                data = {
+                    'model': 'whisper-large-v3',
+                    'language': 'es',
+                    'response_format': 'json'
+                }
                 headers = {
-                    'Authorization': f'Bearer {settings.openrouter_api_key}',
+                    'Authorization': f'Bearer {settings.groq_api_key}',
                 }
 
+                print("🎤 Transcribiendo con Groq (gratis)...")
                 response = await client.post(
-                    'https://openrouter.ai/api/v1/audio/transcriptions',
+                    'https://api.groq.com/openai/v1/audio/transcriptions',
                     files=files,
                     data=data,
                     headers=headers
@@ -217,88 +299,135 @@ async def transcribe_audio_chunk(chunk_path: str) -> Optional[str]:
 
                 if response.status_code == 200:
                     result = response.json()
-                    return result.get('text')
+                    text = result.get('text')
+                    if text:
+                        print(f"✓ Transcripción completada con Groq ({len(text)} caracteres)")
+                        return text
                 else:
-                    print(f"Error en transcripción: {response.status_code} - {response.text}")
+                    print(f"⚠️ Error en Groq: {response.status_code} - {response.text}")
                     return None
     except Exception as e:
-        print(f"Error transcribiendo chunk: {e}")
+        print(f"⚠️ Error con Groq: {e}")
         return None
 
 
-async def transcribe_audio(audio_path: str) -> Optional[str]:
-    """
-    Transcribe el audio usando OpenRouter (Whisper).
-    Si el archivo es muy grande, lo divide en chunks más pequeños.
-    """
+async def transcribe_with_openai(audio_path: str) -> Optional[str]:
+    """Transcribe el audio usando OpenAI Whisper (fallback, de pago)."""
+    if not settings.openai_api_key:
+        print("⚠️ OPENAI_API_KEY no configurada")
+        return None
+    
     try:
-        # Verificar el tamaño del archivo
-        file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        print(f"Tamaño del archivo de audio: {file_size_mb:.2f} MB")
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            with open(audio_path, 'rb') as audio_file:
+                files = {'file': (os.path.basename(audio_path), audio_file, 'audio/mpeg')}
+                data = {
+                    'model': 'whisper-1',
+                    'language': 'es'
+                }
+                headers = {
+                    'Authorization': f'Bearer {settings.openai_api_key}',
+                }
 
-        # Si el archivo es mayor a 20MB, dividirlo en chunks
-        if file_size_mb > 20:
-            print(f"Archivo muy grande ({file_size_mb:.2f} MB), dividiendo en chunks...")
-            chunks = split_audio_into_chunks(audio_path, chunk_duration_ms=600000)  # 10 minutos
-        else:
-            chunks = [audio_path]
+                print("🎤 Transcribiendo con OpenAI Whisper...")
+                response = await client.post(
+                    'https://api.openai.com/v1/audio/transcriptions',
+                    files=files,
+                    data=data,
+                    headers=headers
+                )
 
-        # Transcribir cada chunk
-        transcriptions = []
-        for i, chunk_path in enumerate(chunks):
-            print(f"Transcribiendo chunk {i+1}/{len(chunks)}...")
-            transcription = await transcribe_audio_chunk(chunk_path)
+                if response.status_code == 200:
+                    result = response.json()
+                    text = result.get('text')
+                    if text:
+                        print(f"✓ Transcripción completada con OpenAI ({len(text)} caracteres)")
+                        return text
+                else:
+                    print(f"⚠️ Error en OpenAI: {response.status_code} - {response.text}")
+                    return None
+    except Exception as e:
+        print(f"⚠️ Error con OpenAI: {e}")
+        return None
 
-            if transcription:
-                transcriptions.append(transcription)
-            else:
-                print(f"Advertencia: No se pudo transcribir el chunk {i+1}")
 
-            # Limpiar el chunk si no es el archivo original
-            if chunk_path != audio_path:
-                try:
-                    os.remove(chunk_path)
-                except:
-                    pass
-
-        # Combinar todas las transcripciones
-        if transcriptions:
-            full_transcription = " ".join(transcriptions)
-            print(f"Transcripción completada: {len(full_transcription)} caracteres")
-            return full_transcription
-        else:
+async def transcribe_audio_with_whisper(audio_path: str, file_size_mb: float) -> Optional[str]:
+    """Transcribe el audio usando Groq (gratis) o OpenAI como fallback."""
+    try:
+        # Verificar tamaño
+        if file_size_mb > 25:
+            print(f"❌ Archivo muy grande ({file_size_mb:.2f}MB), máximo 25MB")
             return None
-
+        
+        # Intentar con Groq primero (gratis)
+        transcript = await transcribe_with_groq(audio_path)
+        if transcript:
+            return transcript
+        
+        # Si Groq falla, intentar con OpenAI
+        print("⚠️ Groq falló, intentando con OpenAI...")
+        transcript = await transcribe_with_openai(audio_path)
+        if transcript:
+            return transcript
+        
+        print("❌ No se pudo transcribir el audio con ningún servicio")
+        return None
+        
     except Exception as e:
         print(f"Error transcribiendo audio: {e}")
         return None
     finally:
         # Limpiar archivo temporal original
         try:
-            os.remove(audio_path)
-            os.rmdir(os.path.dirname(audio_path))
-        except:
-            pass
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+                # Limpiar también versiones comprimidas
+                compressed = audio_path.replace('.mp3', '_compressed.mp3')
+                if os.path.exists(compressed):
+                    os.remove(compressed)
+                # Limpiar directorio temporal
+                temp_dir = os.path.dirname(audio_path)
+                if os.path.exists(temp_dir):
+                    os.rmdir(temp_dir)
+        except Exception as cleanup_error:
+            print(f"Error limpiando archivos: {cleanup_error}")
 
 
 async def generate_summary(text: str, language: str = "es") -> str:
     """Genera un resumen usando OpenRouter."""
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            prompt = f"""Eres un experto en crear resúmenes concisos y útiles de videos.
-Analiza el siguiente texto (transcripción de un video de YouTube) y genera un resumen en español que incluya:
+            prompt = f"""Eres un experto en crear resúmenes detallados de videos de YouTube. Tu objetivo es que la persona que lea el resumen comprenda completamente el contenido del video, casi como si lo hubiera visto.
 
-1. **Tema principal**: Una frase que resuma de qué trata el video
-2. **Puntos clave**: Los 5-7 puntos más importantes del video (usa viñetas)
-3. **Conclusiones**: Las ideas principales o conclusiones del video
-4. **Información relevante**: Cualquier dato, estadística o información específica que sea importante recordar
+Analiza el siguiente texto (transcripción completa de un video de YouTube) y genera un resumen DETALLADO en español que incluya:
 
-El resumen debe ser claro, estructurado y fácil de leer. Usa markdown para el formato.
+1. **Introducción y contexto**: ¿De qué trata el video? ¿Cuál es el tema principal y por qué es importante?
 
-TEXTO:
-{text[:15000]}  # Limitamos a ~15k caracteres para evitar costos excesivos
+2. **Desarrollo completo**: Explica TODO el contenido del video de forma estructurada y cronológica. Incluye:
+   - Todos los conceptos importantes explicados
+   - Ejemplos mencionados
+   - Argumentos y razonamientos presentados
+   - Procesos o pasos descritos
+   - Historias o anécdotas relevantes
 
-Genera el resumen en ESPAÑOL."""
+3. **Datos y cifras**: Cualquier estadística, número, fecha o dato específico mencionado
+
+4. **Conclusiones y puntos clave**: Las ideas principales y mensajes finales del video
+
+5. **Información práctica**: Si hay consejos, recomendaciones o aplicaciones prácticas, menciónalos
+
+REQUISITOS:
+- Sé DETALLADO y exhaustivo, no te limites a puntos generales
+- Usa un tono claro y natural, como si estuvieras explicándoselo a alguien
+- Organiza el contenido con subtítulos, listas y párrafos según sea necesario
+- Usa markdown para el formato
+- Si el video tiene secciones claras, respeta esa estructura
+- NO omitas información importante, queremos capturar TODO el valor del video
+
+TEXTO DE LA TRANSCRIPCIÓN:
+{text[:30000]}
+
+Genera el resumen DETALLADO en ESPAÑOL:"""
 
             response = await client.post(
                 'https://openrouter.ai/api/v1/chat/completions',
@@ -308,7 +437,7 @@ Genera el resumen en ESPAÑOL."""
                         {'role': 'user', 'content': prompt}
                     ],
                     'temperature': 0.7,
-                    'max_tokens': 2000
+                    'max_tokens': 4000
                 },
                 headers={
                     'Authorization': f'Bearer {settings.openrouter_api_key}',
@@ -375,7 +504,7 @@ def get_video_info(video_id: str) -> dict:
 
 
 @app.post("/api/summarize", response_model=SummaryResponse)
-async def summarize_video(request: VideoRequest):
+async def summarize_video(request: VideoRequest, db: Session = Depends(get_db)):
     """
     Procesa una URL de YouTube y devuelve un resumen del contenido.
     """
@@ -383,6 +512,19 @@ async def summarize_video(request: VideoRequest):
     video_id = extract_video_id(str(request.url))
     if not video_id:
         raise HTTPException(status_code=400, detail="URL de YouTube inválida")
+
+    # Verificar si ya existe en la base de datos
+    existing_summary = db.query(DBSummary).filter(DBSummary.video_id == video_id).first()
+    if existing_summary:
+        print(f"✓ Resumen encontrado en base de datos para {video_id}")
+        return SummaryResponse(
+            video_id=existing_summary.video_id,
+            title=existing_summary.title,
+            transcript_method=existing_summary.transcript_method,
+            summary=existing_summary.summary,
+            cost_estimate=existing_summary.cost_estimate,
+            created_at=existing_summary.created_at
+        )
 
     # Obtener información del video
     video_info = get_video_info(video_id)
@@ -395,16 +537,17 @@ async def summarize_video(request: VideoRequest):
     # Si no hay subtítulos, descargar y transcribir audio
     if not transcript:
         print(f"No hay subtítulos disponibles. Descargando audio...")
-        audio_path = download_audio(video_id)
+        audio_result = download_audio(video_id)
 
-        if not audio_path:
+        if not audio_result:
             raise HTTPException(
                 status_code=500,
                 detail="No se pudo obtener el contenido del video (sin subtítulos ni audio disponible)"
             )
-
+        
+        audio_path, file_size_mb = audio_result
         print(f"Transcribiendo audio...")
-        transcript = await transcribe_audio(audio_path)
+        transcript = await transcribe_audio_with_whisper(audio_path, file_size_mb)
         transcript_method = "transcription"
 
         if not transcript:
@@ -423,13 +566,79 @@ async def summarize_video(request: VideoRequest):
     else:
         cost_estimate = "~$0.01 - $0.03 (transcripción + resumen)"
 
-    return SummaryResponse(
+    # Guardar en la base de datos
+    db_summary = DBSummary(
         video_id=video_id,
         title=video_info['title'],
         transcript_method=transcript_method,
         summary=summary,
         cost_estimate=cost_estimate
     )
+    db.add(db_summary)
+    db.commit()
+    db.refresh(db_summary)
+    print(f"✓ Resumen guardado en base de datos")
+
+    return SummaryResponse(
+        video_id=video_id,
+        title=video_info['title'],
+        transcript_method=transcript_method,
+        summary=summary,
+        cost_estimate=cost_estimate,
+        created_at=db_summary.created_at
+    )
+
+
+@app.get("/api/summaries", response_model=List[SummaryListItem])
+async def get_summaries(limit: int = 50, db: Session = Depends(get_db)):
+    """
+    Obtiene el historial de resúmenes guardados.
+    """
+    summaries = db.query(DBSummary).order_by(DBSummary.created_at.desc()).limit(limit).all()
+    return summaries
+
+
+@app.get("/api/summaries/{video_id}", response_model=SummaryResponse)
+async def get_summary(video_id: str, db: Session = Depends(get_db)):
+    """
+    Obtiene un resumen específico por video_id.
+    """
+    summary = db.query(DBSummary).filter(DBSummary.video_id == video_id).first()
+    if not summary:
+        raise HTTPException(status_code=404, detail="Resumen no encontrado")
+    
+    return SummaryResponse(
+        video_id=summary.video_id,
+        title=summary.title,
+        transcript_method=summary.transcript_method,
+        summary=summary.summary,
+        cost_estimate=summary.cost_estimate,
+        created_at=summary.created_at
+    )
+
+
+@app.delete("/api/summaries/{video_id}")
+async def delete_summary(video_id: str, db: Session = Depends(get_db)):
+    """
+    Elimina un resumen específico.
+    """
+    summary = db.query(DBSummary).filter(DBSummary.video_id == video_id).first()
+    if not summary:
+        raise HTTPException(status_code=404, detail="Resumen no encontrado")
+    
+    db.delete(summary)
+    db.commit()
+    return {"message": "Resumen eliminado"}
+
+
+@app.delete("/api/summaries")
+async def delete_all_summaries(db: Session = Depends(get_db)):
+    """
+    Elimina todos los resúmenes.
+    """
+    db.query(DBSummary).delete()
+    db.commit()
+    return {"message": "Todos los resúmenes eliminados"}
 
 
 @app.get("/", response_class=HTMLResponse)
