@@ -1,7 +1,7 @@
 import os
 import tempfile
 import re
-from typing import Optional
+from typing import Optional, List
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +17,7 @@ from youtube_transcript_api._errors import (
 )
 import yt_dlp
 import httpx
+from pydub import AudioSegment
 
 
 class Settings(BaseSettings):
@@ -154,11 +155,53 @@ def download_audio(video_id: str) -> Optional[str]:
         return None
 
 
-async def transcribe_audio(audio_path: str) -> Optional[str]:
-    """Transcribe el audio usando OpenRouter (Whisper)."""
+def split_audio_into_chunks(audio_path: str, chunk_duration_ms: int = 600000) -> List[str]:
+    """
+    Divide un archivo de audio en chunks más pequeños.
+
+    Args:
+        audio_path: Ruta al archivo de audio
+        chunk_duration_ms: Duración de cada chunk en milisegundos (default: 10 minutos)
+
+    Returns:
+        Lista de rutas a los archivos de chunks
+    """
+    try:
+        # Cargar el audio
+        audio = AudioSegment.from_mp3(audio_path)
+
+        # Calcular número de chunks necesarios
+        total_duration = len(audio)
+        chunks = []
+
+        # Si el audio es más corto que el chunk_duration, devolver el archivo original
+        if total_duration <= chunk_duration_ms:
+            return [audio_path]
+
+        # Dividir en chunks
+        temp_dir = os.path.dirname(audio_path)
+        base_name = os.path.splitext(os.path.basename(audio_path))[0]
+
+        for i, start_time in enumerate(range(0, total_duration, chunk_duration_ms)):
+            end_time = min(start_time + chunk_duration_ms, total_duration)
+            chunk = audio[start_time:end_time]
+
+            chunk_path = os.path.join(temp_dir, f"{base_name}_chunk_{i}.mp3")
+            chunk.export(chunk_path, format="mp3", bitrate="64k")
+            chunks.append(chunk_path)
+
+        print(f"Audio dividido en {len(chunks)} chunks")
+        return chunks
+    except Exception as e:
+        print(f"Error dividiendo audio en chunks: {e}")
+        return [audio_path]  # Si falla, devolver el archivo original
+
+
+async def transcribe_audio_chunk(chunk_path: str) -> Optional[str]:
+    """Transcribe un chunk de audio usando OpenRouter (Whisper)."""
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
-            with open(audio_path, 'rb') as audio_file:
+            with open(chunk_path, 'rb') as audio_file:
                 files = {'file': audio_file}
                 data = {'model': settings.transcription_model}
                 headers = {
@@ -179,10 +222,58 @@ async def transcribe_audio(audio_path: str) -> Optional[str]:
                     print(f"Error en transcripción: {response.status_code} - {response.text}")
                     return None
     except Exception as e:
+        print(f"Error transcribiendo chunk: {e}")
+        return None
+
+
+async def transcribe_audio(audio_path: str) -> Optional[str]:
+    """
+    Transcribe el audio usando OpenRouter (Whisper).
+    Si el archivo es muy grande, lo divide en chunks más pequeños.
+    """
+    try:
+        # Verificar el tamaño del archivo
+        file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        print(f"Tamaño del archivo de audio: {file_size_mb:.2f} MB")
+
+        # Si el archivo es mayor a 20MB, dividirlo en chunks
+        if file_size_mb > 20:
+            print(f"Archivo muy grande ({file_size_mb:.2f} MB), dividiendo en chunks...")
+            chunks = split_audio_into_chunks(audio_path, chunk_duration_ms=600000)  # 10 minutos
+        else:
+            chunks = [audio_path]
+
+        # Transcribir cada chunk
+        transcriptions = []
+        for i, chunk_path in enumerate(chunks):
+            print(f"Transcribiendo chunk {i+1}/{len(chunks)}...")
+            transcription = await transcribe_audio_chunk(chunk_path)
+
+            if transcription:
+                transcriptions.append(transcription)
+            else:
+                print(f"Advertencia: No se pudo transcribir el chunk {i+1}")
+
+            # Limpiar el chunk si no es el archivo original
+            if chunk_path != audio_path:
+                try:
+                    os.remove(chunk_path)
+                except:
+                    pass
+
+        # Combinar todas las transcripciones
+        if transcriptions:
+            full_transcription = " ".join(transcriptions)
+            print(f"Transcripción completada: {len(full_transcription)} caracteres")
+            return full_transcription
+        else:
+            return None
+
+    except Exception as e:
         print(f"Error transcribiendo audio: {e}")
         return None
     finally:
-        # Limpiar archivo temporal
+        # Limpiar archivo temporal original
         try:
             os.remove(audio_path)
             os.rmdir(os.path.dirname(audio_path))
