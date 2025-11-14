@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar el código de la aplicación
 COPY main.py .
+COPY database.py .
 COPY index.html .
 
 # Exponer puerto
