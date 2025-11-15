@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  youtube-summarizer:
+    image: ${DOCKER_IMAGE:-ghcr.io/kukapu/youtube-to-resume:latest}
+    container_name: youtube-summarizer
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - SUMMARY_MODEL=${SUMMARY_MODEL:-openai/gpt-4o-mini}
+      - TRANSCRIPTION_MODEL=${TRANSCRIPTION_MODEL:-openai/whisper-large-v3}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=8000
+      - DATABASE_URL=${DATABASE_URL}
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
