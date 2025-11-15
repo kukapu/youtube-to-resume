@@ -19,7 +19,6 @@ from youtube_transcript_api._errors import (
 )
 import yt_dlp
 import httpx
-from pydub import AudioSegment
 
 from database import get_db, init_db, Summary as DBSummary
 
@@ -247,7 +246,7 @@ def compress_audio(input_path: str, target_mb: int = 24) -> Optional[str]:
     try:
         import subprocess
         output_path = input_path.replace('.mp3', '_compressed.mp3')
-        
+
         # Usar ffmpeg para comprimir a calidad muy baja
         cmd = [
             'ffmpeg', '-i', input_path,
@@ -256,18 +255,105 @@ def compress_audio(input_path: str, target_mb: int = 24) -> Optional[str]:
             '-ac', '1',  # Mono
             '-y', output_path
         ]
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode == 0 and os.path.exists(output_path):
             new_size = os.path.getsize(output_path) / (1024 * 1024)
             print(f"✓ Audio comprimido a {new_size:.2f}MB")
             return output_path
-        
+
         return None
     except Exception as e:
         print(f"Error comprimiendo audio: {e}")
         return None
+
+
+def get_audio_duration(audio_path: str) -> Optional[float]:
+    """Obtiene la duración del audio en segundos usando ffprobe."""
+    try:
+        import subprocess
+        cmd = [
+            'ffprobe',
+            '-v', 'quiet',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            audio_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            duration = float(result.stdout.strip())
+            return duration
+
+        return None
+    except Exception as e:
+        print(f"Error obteniendo duración del audio: {e}")
+        return None
+
+
+def split_audio_into_chunks(audio_path: str, chunk_duration_sec: int = 600) -> List[str]:
+    """
+    Divide un archivo de audio en chunks usando ffmpeg.
+
+    Args:
+        audio_path: Ruta al archivo de audio
+        chunk_duration_sec: Duración de cada chunk en segundos (default: 10 minutos)
+
+    Returns:
+        Lista de rutas a los archivos de chunks
+    """
+    try:
+        import subprocess
+
+        # Obtener duración total
+        total_duration = get_audio_duration(audio_path)
+        if not total_duration:
+            print("⚠️ No se pudo obtener duración, usando archivo completo")
+            return [audio_path]
+
+        # Si el audio es más corto que chunk_duration, devolver el archivo original
+        if total_duration <= chunk_duration_sec:
+            return [audio_path]
+
+        # Calcular número de chunks
+        num_chunks = int(total_duration / chunk_duration_sec) + 1
+        print(f"📂 Dividiendo audio de {total_duration:.0f}s en {num_chunks} chunks de {chunk_duration_sec}s")
+
+        # Dividir en chunks
+        temp_dir = os.path.dirname(audio_path)
+        base_name = os.path.splitext(os.path.basename(audio_path))[0]
+        chunks = []
+
+        for i in range(num_chunks):
+            start_time = i * chunk_duration_sec
+            chunk_path = os.path.join(temp_dir, f"{base_name}_chunk_{i}.mp3")
+
+            cmd = [
+                'ffmpeg',
+                '-i', audio_path,
+                '-ss', str(start_time),
+                '-t', str(chunk_duration_sec),
+                '-c', 'copy',  # Copiar sin re-encodear (más rápido)
+                '-y',
+                chunk_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0 and os.path.exists(chunk_path):
+                chunk_size = os.path.getsize(chunk_path) / (1024 * 1024)
+                print(f"  ✓ Chunk {i+1}/{num_chunks}: {chunk_size:.2f}MB")
+                chunks.append(chunk_path)
+            else:
+                print(f"  ⚠️ Error creando chunk {i+1}")
+
+        return chunks if chunks else [audio_path]
+
+    except Exception as e:
+        print(f"Error dividiendo audio en chunks: {e}")
+        return [audio_path]
 
 
 async def transcribe_with_groq(audio_path: str) -> Optional[str]:
@@ -352,43 +438,90 @@ async def transcribe_with_openai(audio_path: str) -> Optional[str]:
 
 
 async def transcribe_audio_with_whisper(audio_path: str, file_size_mb: float) -> Optional[str]:
-    """Transcribe el audio usando Groq (gratis) o OpenAI como fallback."""
+    """Transcribe el audio usando Groq (gratis) o OpenAI como fallback.
+
+    Si el archivo es > 25MB, lo divide en chunks y transcribe cada uno por separado.
+    """
+    chunks_to_cleanup = []
+
     try:
-        # Verificar tamaño
+        # Si el archivo es muy grande, dividir en chunks
         if file_size_mb > 25:
-            print(f"❌ Archivo muy grande ({file_size_mb:.2f}MB), máximo 25MB")
+            print(f"⚠️ Archivo grande ({file_size_mb:.2f}MB), dividiendo en chunks...")
+            chunks = split_audio_into_chunks(audio_path, chunk_duration_sec=600)  # 10 minutos
+
+            if len(chunks) == 1 and chunks[0] == audio_path:
+                # No se pudo dividir, el archivo sigue siendo muy grande
+                print(f"❌ No se pudo dividir el archivo, sigue siendo muy grande")
+                return None
+
+            chunks_to_cleanup = [c for c in chunks if c != audio_path]
+        else:
+            # Archivo pequeño, usar directamente
+            chunks = [audio_path]
+
+        # Transcribir cada chunk
+        transcripts = []
+
+        for i, chunk_path in enumerate(chunks):
+            chunk_size_mb = os.path.getsize(chunk_path) / (1024 * 1024)
+
+            # Verificar que el chunk no sea muy grande
+            if chunk_size_mb > 25:
+                print(f"⚠️ Chunk {i+1} muy grande ({chunk_size_mb:.2f}MB), saltando...")
+                continue
+
+            print(f"🎤 Transcribiendo chunk {i+1}/{len(chunks)} ({chunk_size_mb:.2f}MB)...")
+
+            # Intentar con Groq primero (gratis)
+            transcript = await transcribe_with_groq(chunk_path)
+
+            # Si Groq falla, intentar con OpenAI
+            if not transcript:
+                print(f"⚠️ Groq falló para chunk {i+1}, intentando con OpenAI...")
+                transcript = await transcribe_with_openai(chunk_path)
+
+            if transcript:
+                transcripts.append(transcript)
+                print(f"✓ Chunk {i+1}/{len(chunks)} transcrito ({len(transcript)} caracteres)")
+            else:
+                print(f"⚠️ No se pudo transcribir chunk {i+1}")
+
+        if not transcripts:
+            print("❌ No se pudo transcribir ningún chunk")
             return None
-        
-        # Intentar con Groq primero (gratis)
-        transcript = await transcribe_with_groq(audio_path)
-        if transcript:
-            return transcript
-        
-        # Si Groq falla, intentar con OpenAI
-        print("⚠️ Groq falló, intentando con OpenAI...")
-        transcript = await transcribe_with_openai(audio_path)
-        if transcript:
-            return transcript
-        
-        print("❌ No se pudo transcribir el audio con ningún servicio")
-        return None
-        
+
+        # Combinar todas las transcripciones
+        full_transcript = " ".join(transcripts)
+        print(f"✓ Transcripción completa: {len(full_transcript)} caracteres de {len(chunks)} chunks")
+
+        return full_transcript
+
     except Exception as e:
         print(f"Error transcribiendo audio: {e}")
         return None
     finally:
-        # Limpiar archivo temporal original
+        # Limpiar archivos temporales
         try:
+            # Limpiar archivo original
             if os.path.exists(audio_path):
                 os.remove(audio_path)
-                # Limpiar también versiones comprimidas
-                compressed = audio_path.replace('.mp3', '_compressed.mp3')
-                if os.path.exists(compressed):
-                    os.remove(compressed)
-                # Limpiar directorio temporal
-                temp_dir = os.path.dirname(audio_path)
-                if os.path.exists(temp_dir):
-                    os.rmdir(temp_dir)
+
+            # Limpiar chunks
+            for chunk_path in chunks_to_cleanup:
+                if os.path.exists(chunk_path):
+                    os.remove(chunk_path)
+
+            # Limpiar versiones comprimidas
+            compressed = audio_path.replace('.mp3', '_compressed.mp3')
+            if os.path.exists(compressed):
+                os.remove(compressed)
+
+            # Limpiar directorio temporal
+            temp_dir = os.path.dirname(audio_path)
+            if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+                os.rmdir(temp_dir)
+
         except Exception as cleanup_error:
             print(f"Error limpiando archivos: {cleanup_error}")
 
